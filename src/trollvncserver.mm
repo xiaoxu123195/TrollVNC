@@ -3113,99 +3113,132 @@ NS_INLINE TVClientState *tvGetClientState(rfbClientPtr cl) { return cl ? (TVClie
 
 static dispatch_queue_t gWheelQueue = nil; // serial queue for wheel gestures
 
-static void wheelScheduleFlush(rfbClientPtr cl, CGPoint anchorPoint, double delaySec, int rotQ) {
-    TVClientState *st = tvGetClientState(cl);
-    if (!st)
-        return;
+// Wheel emulation: keep one finger down while the wheel keeps turning and slide it by the
+// accumulated distance; lift once the wheel has been idle for a moment. Lifting after every
+// burst made iOS fling, and the next burst's touch-down stopped the fling again, which felt
+// like stutter. There is a single digitizer, so the wheel finger is global, not per client.
+// Everything below runs on gWheelQueue.
+static BOOL gWheelHeld = NO;
+static CGPoint gWheelAnchor;     // where the finger went down (device space)
+static CGPoint gWheelPoint;      // where the finger is now
+static double gWheelPending = 0; // distance still to slide, in pixels (+ = finger moves down)
+static CFAbsoluteTime gWheelLastInput = 0;
+static int gWheelRotQ = 0;
+static dispatch_source_t gWheelTimer = nil;
 
-    if (gWheelStepPx <= 0) { // disabled
-        st->wheelAccumPx = 0.0;
-        st->wheelFlushScheduled = NO;
+static const double kWheelTickSec = 1.0 / 60.0; // how often the finger moves
+static const double kWheelIdleSec = 0.15;       // lift after this long without wheel input
+static const double kWheelEdgeRatio = 0.1;      // keep the finger this far from the screen edges
+
+// wheelAxisRange the usable range along the axis the finger slides on
+static void wheelAxisRange(int rotQ, CGFloat *lo, CGFloat *hi) {
+    CGFloat size = (rotQ & 1) ? (CGFloat)gSrcWidth : (CGFloat)gSrcHeight;
+    *lo = size * kWheelEdgeRatio;
+    *hi = size * (1.0 - kWheelEdgeRatio);
+}
+
+// wheelAxisValue / wheelSetAxis read and write the coordinate the finger slides on
+static CGFloat wheelAxisValue(CGPoint p, int rotQ) { return (rotQ & 1) ? p.x : p.y; }
+
+static CGPoint wheelSetAxis(CGPoint p, int rotQ, CGFloat v) {
+    if (rotQ & 1)
+        p.x = v;
+    else
+        p.y = v;
+    return p;
+}
+
+// wheelSign maps "VNC down" onto the device axis for the current rotation
+static double wheelSign(int rotQ) {
+    switch (rotQ & 3) {
+    case 2: // upside-down
+    case 3: // landscape right (270 CW)
+        return -1.0;
+    default:
+        return 1.0;
+    }
+}
+
+static void wheelLift(void) {
+    if (gWheelTimer) {
+        dispatch_source_cancel(gWheelTimer);
+        gWheelTimer = nil;
+    }
+    if (!gWheelHeld)
+        return;
+    gWheelHeld = NO;
+    gWheelPending = 0;
+    CGPoint p = gWheelPoint;
+    [[STHIDEventGenerator sharedGenerator] liftUpAtPoints:&p touchCount:1];
+}
+
+static void wheelTick(void) {
+    if (!gWheelHeld)
+        return;
+    if (fabs(gWheelPending) < 0.5) {
+        if (CFAbsoluteTimeGetCurrent() - gWheelLastInput > kWheelIdleSec)
+            wheelLift();
         return;
     }
 
-    // Ensure client remains valid during delayed execution
-    rfbIncrClientRef(cl);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)), gWheelQueue, ^{
-        TVClientState *st2 = tvGetClientState(cl);
-        if (!st2) {
-            rfbDecrClientRef(cl);
-            return;
-        }
+    // Spread a notch over a few frames instead of jumping
+    double maxStep = fmax(gWheelStepPx * 0.4, 8.0);
+    double step = fmax(-maxStep, fmin(maxStep, gWheelPending));
+    gWheelPending -= step;
 
-        // Consume the entire accumulation in one gesture to avoid many small drags.
-        double takeRaw = st2->wheelAccumPx;
-        st2->wheelAccumPx = 0.0; // zero out
-        st2->wheelFlushScheduled = NO;
-        double mag = fabs(takeRaw);
-        if (mag < 1.0) {
-            rfbDecrClientRef(cl);
-            return;
-        }
+    STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+    CGFloat lo, hi;
+    wheelAxisRange(gWheelRotQ, &lo, &hi);
+    CGFloat next = wheelAxisValue(gWheelPoint, gWheelRotQ) + (CGFloat)(step * wheelSign(gWheelRotQ));
+    if (next < lo || next > hi) {
+        // Ran into the edge: lift and grab again at the anchor to keep scrolling
+        CGPoint p = gWheelPoint;
+        [gen liftUpAtPoints:&p touchCount:1];
+        CGPoint a = gWheelAnchor;
+        [gen touchDownAtPoints:&a touchCount:1];
+        gWheelPoint = a;
+        return;
+    }
+    gWheelPoint = wheelSetAxis(gWheelPoint, gWheelRotQ, next);
+    CGPoint p = gWheelPoint;
+    [gen _updateTouchPoints:&p count:1];
+}
 
-        // Velocity-like amplification: for larger accumulations (faster wheel),
-        // slightly increase distance instead of emitting many short drags.
-        double amp = 1.0 + fmin(gWheelAmpCap, gWheelAmpCoeff * log1p(mag / fmax(gWheelStepPx, 1.0)));
-        double take = copysign(mag * amp, takeRaw);
+static void wheelAdd(CGPoint anchor, double delta, int rotQ) {
+    gWheelLastInput = CFAbsoluteTimeGetCurrent();
+    if (!gWheelHeld) {
+        // Start away from the edges so there is room to slide before having to grab again
+        CGFloat lo, hi;
+        wheelAxisRange(rotQ, &lo, &hi);
+        CGFloat v = wheelAxisValue(anchor, rotQ);
+        CGFloat inner = (hi - lo) * 0.25;
+        v = fmax(lo + inner, fmin(hi - inner, v));
+        gWheelAnchor = wheelSetAxis(anchor, rotQ, v);
+        gWheelPoint = gWheelAnchor;
+        gWheelRotQ = rotQ;
+        gWheelPending = 0;
+        gWheelHeld = YES;
+        CGPoint p = gWheelAnchor;
+        [[STHIDEventGenerator sharedGenerator] touchDownAtPoints:&p touchCount:1];
 
-        // Guarantee a small-but-meaningful movement for tiny scrolls
-        if (fabs(take) < (gWheelMinTakeRatio * gWheelStepPx)) {
-            take = copysign(gWheelMinTakeRatio * gWheelStepPx, take);
-        }
+        gWheelTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gWheelQueue);
+        uint64_t interval = (uint64_t)(kWheelTickSec * NSEC_PER_SEC);
+        dispatch_source_set_timer(gWheelTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval), interval,
+                                  interval / 8);
+        dispatch_source_set_event_handler(gWheelTimer, ^{
+            wheelTick();
+        });
+        dispatch_resume(gWheelTimer);
+    }
+    gWheelPending += delta;
+}
 
-        // Absolute clamp for safety
-        double absClamp = gWheelMaxStepPx * gWheelAbsClampFactor;
-        if (take > absClamp)
-            take = absClamp;
-        if (take < -absClamp)
-            take = -absClamp;
-
-        // Map VNC-vertical delta into device axis based on rotation
-        CGFloat dx = 0, dy = 0;
-        switch (rotQ & 3) {
-        case 0: // portrait
-            dx = 0;
-            dy = (CGFloat)take;
-            break;
-        case 2: // upside-down
-            dx = 0;
-            dy = (CGFloat)(-take);
-            break;
-        case 1: // landscape left (90 CW)
-            dx = (CGFloat)(+take);
-            dy = 0;
-            break;
-        case 3: // landscape right (270 CW)
-            dx = (CGFloat)(-take);
-            dy = 0;
-            break;
-        }
-
-        CGFloat endX = anchorPoint.x + dx;
-        CGFloat endY = anchorPoint.y + dy;
-        if (endX < 0)
-            endX = 0;
-        CGFloat maxX = (CGFloat)gSrcWidth - 1;
-        if (endX > maxX)
-            endX = maxX;
-        if (endY < 0)
-            endY = 0;
-        CGFloat maxY = (CGFloat)gSrcHeight - 1;
-        if (endY > maxY)
-            endY = maxY;
-        CGPoint endPt = CGPointMake(endX, endY);
-
-        // Duration scales sub-linearly with distance; parameters configurable
-        double dur = gWheelDurBase + gWheelDurK * sqrt(fabs(take));
-        if (dur > gWheelDurMax)
-            dur = gWheelDurMax;
-        if (dur < gWheelDurMin)
-            dur = gWheelDurMin;
-
-        [[STHIDEventGenerator sharedGenerator] dragLinearWithStartPoint:anchorPoint endPoint:endPt duration:dur];
-
-        rfbDecrClientRef(cl);
-    });
+// wheelRelease lifts the wheel finger before something else needs the digitizer
+static void wheelRelease(void) {
+    if (gWheelQueue)
+        dispatch_sync(gWheelQueue, ^{
+            wheelLift();
+        });
 }
 
 static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
@@ -3222,6 +3255,7 @@ static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
     bool leftNow = (buttonMask & 1) != 0;
     bool leftPrev = (lastMask & 1) != 0;
     if (leftNow && !leftPrev) {
+        wheelRelease();
         [gen touchDownAtPoints:&pt touchCount:1];
     } else if (!leftNow && leftPrev) {
         [gen liftUpAtPoints:&pt touchCount:1];
@@ -3248,7 +3282,7 @@ static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
         [gen menuUp];
     }
 
-    // Wheel emulation: coalesce ticks and perform async flicks off the VNC thread.
+    // Wheel emulation: hold a finger down and slide it off the VNC thread (see wheelAdd).
     bool wheelUpNow = (buttonMask & 8) != 0;  // button 4
     bool wheelDnNow = (buttonMask & 16) != 0; // button 5
     bool wheelUpPrev = (lastMask & 8) != 0;
@@ -3259,23 +3293,14 @@ static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
         gWheelQueue = dispatch_queue_create("com.82flex.trollvnc.wheel", DISPATCH_QUEUE_SERIAL_WITH_AUTORELEASE_POOL);
     });
 
-    if (gWheelStepPx > 0 && ((wheelUpNow && !wheelUpPrev) || (wheelDnNow && !wheelDnPrev))) {
+    // While the left button holds a finger down the digitizer is busy: ignore the wheel
+    if (gWheelStepPx > 0 && !leftNow && ((wheelUpNow && !wheelUpPrev) || (wheelDnNow && !wheelDnPrev))) {
         double delta = (wheelDnNow && !wheelDnPrev) ? +gWheelStepPx : -gWheelStepPx;
         if (gWheelNaturalDir)
             delta = -delta;
         int rotQ = (gOrientationSyncEnabled ? gRotationQuad.load(std::memory_order_relaxed) : 0) & 3;
-        // Ensure client remains valid while we touch its state asynchronously
-        rfbIncrClientRef(cl);
         dispatch_async(gWheelQueue, ^{
-            TVClientState *st2 = tvGetClientState(cl);
-            if (st2) {
-                st2->wheelAccumPx += delta;
-                if (!st2->wheelFlushScheduled) {
-                    st2->wheelFlushScheduled = YES;
-                    wheelScheduleFlush(cl, pt, gWheelCoalesceSec, rotQ);
-                }
-            }
-            rfbDecrClientRef(cl);
+            wheelAdd(pt, delta, rotQ);
         });
     }
 
@@ -4082,6 +4107,13 @@ static void clientGoneHook(rfbClientPtr cl) {
         TVLog(@"No clients remaining; KeepAlive stopped.");
     }
 
+    // A client that disconnects mid-scroll must not leave the wheel finger on the screen
+    if (gWheelQueue) {
+        dispatch_async(gWheelQueue, ^{
+            wheelLift();
+        });
+    }
+
     // Update TXT with possibly changed state (e.g., viewOnly unaffected, but keep consistent)
     refreshBonjourTXTRecord();
 
@@ -4576,6 +4608,10 @@ static void setupRfbScreen(int argc, const char *argv[]) {
     TVBindHostKind hostKind = tvClassifyBindHost(gBindHost, &v4Addr, &v6Addr);
     if (hostKind == kTVBindHostKindIPv4) {
         gScreen->listenInterface = v4Addr;
+        // The IPv6 listener (VNC and HTTP) has its own interface setting and would otherwise
+        // accept on every interface. Keep it on loopback so binding to an IPv4 address really
+        // limits who can connect.
+        gScreen->listen6Interface = strdup("::1");
     } else if (hostKind == kTVBindHostKindIPv6) {
         char ifaceBuf[INET6_ADDRSTRLEN];
         const char *iface = inet_ntop(AF_INET6, &v6Addr, ifaceBuf, sizeof(ifaceBuf));
